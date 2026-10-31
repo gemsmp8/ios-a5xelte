@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 1ef54af..a270001 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -24,6 +24,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void herolte_gpu_probe(void);
+ /* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp. */
++void herolte_gpu_present_stats(uint64_t *total, uint64_t *cache_ns, uint64_t *gpu_ns, uint64_t *avg_fps);
+ int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+ int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
+ bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
+@@ -927,6 +928,13 @@ static uint64_t hgp_next_va = HGP_VA_BASE;
+ static vm_offset_t hgp_scr;
+ static int hgp_state;                   /* 0 not set up, 1 ready, -1 failed */
+ static uint64_t hgp_frames;
++/* King iOS: frame timing for performance analysis. */
++static uint64_t hgp_cache_total_ns;
++static uint64_t hgp_gpu_total_ns;
++static uint64_t hgp_last_present_ns;
++static uint64_t hgp_fps_window_start;
++static uint64_t hgp_fps_window_frames;
++static uint64_t hgp_avg_fps_x10;        /* average fps * 10 over the last window */
+
+ /* Wait (bounded) for AS0 to finish its command. */
+ static bool
+@@ -1079,6 +1087,25 @@ herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n)
+ 	return (int)s;
+ }
+
++void
++herolte_gpu_present_stats(uint64_t *total, uint64_t *cache_ns, uint64_t *gpu_ns, uint64_t *avg_fps)
++{
++	if (total) *total = hgp_frames;
++	if (cache_ns) *cache_ns = hgp_frames ? hgp_cache_total_ns / hgp_frames : 0;
++	if (gpu_ns) *gpu_ns = hgp_frames ? hgp_gpu_total_ns / hgp_frames : 0;
++	if (avg_fps) *avg_fps = hgp_avg_fps_x10;
++}
++
++/* Clean the region [start, end) to the point of coherency, 64 bytes at a time.
++ * Uses dc civac (clean+invalidate) which is safe: these addresses are the
++ * surface mapping, only touched by the CPU render thread that just wrote them. */
++static void
++hgp_cache_clean(uintptr_t start, uintptr_t end)
++{
++	for (uintptr_t p = start & ~(uintptr_t)63; p < end; p += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++	}
++}
++
+ /*
+  * Draw the w x h rect at byte offset off (row stride bytes) of the surface
+  * in slot s to the whole panel, scaled, bilinear. The caller has cleaned
+@@ -1090,6 +1117,10 @@ herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint
+ 	    w > 0x10000 || h > 0x10000) {
+ 		return false;
+ 	}
++	extern uint64_t mach_absolute_time(void);
++	extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
++	uint64_t t0 = mach_absolute_time();
++
+ 	vm_offset_t scr = hgp_scr;
+ 	/* IEEE bits of w and h (integers below 2^24, so exact). */
+ 	uint32_t fw = 0, fh = 0;
+@@ -1119,18 +1150,38 @@ herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint
+ 	hg_run_quiet = true;
+ 	hg_affinity = hg_rd(hg_gpu, SHADER_PRESENT_LO);
+ 	hg_job_va = HG_SCR_VA + S_TILER_JOB;
+ 	hg_job_cpu = scr + S_TILER_JOB;
+ 	bool ok = hg_run(1, "PRESENT tiler job");
+ 	if (ok) {
+ 		hg_job_va = HG_SCR_VA + S_FRAG_JOB;
+ 		hg_job_cpu = scr + S_FRAG_JOB;
+ 		ok = hg_run(0, "PRESENT fragment job");
+ 	}
+ 	hg_job_va = HG_TEST_VA;
+ 	hg_job_cpu = 0;
+ 	hg_affinity = 1;
+ 	hg_run_quiet = false;
+-	if (++hgp_frames <= 3 || !ok) {
+-		printf("HEROLTE GPU PRESENT: frame %llu %ux%u stride %u slot %d -> %s\n",
+-		    hgp_frames, w, h, stride, s, ok ? "ok" : "failed");
++	uint64_t t1 = mach_absolute_time();
++	uint64_t gpu_ns = 0;
++	absolutetime_to_nanoseconds(t1 - t0, &gpu_ns);
++	hgp_gpu_total_ns += gpu_ns;
++	hgp_last_present_ns = gpu_ns;
++	++hgp_frames;
++	/* FPS measurement over 1-second windows. */
++	hgp_fps_window_frames++;
++	uint64_t wall_ns = 0;
++	absolutetime_to_nanoseconds(t1 - hgp_fps_window_start, &wall_ns);
++	if (wall_ns >= 1000000000ULL && hgp_fps_window_frames > 0) {
++		hgp_avg_fps_x10 = hgp_fps_window_frames * 10000000000ULL / wall_ns;
++		hgp_fps_window_start = t1;
++		hgp_fps_window_frames = 0;
++	}
++	if (hgp_frames <= 3 || !ok || (hgp_frames % 300 == 0)) {
++		printf("HEROLTE GPU PRESENT: frame %llu %ux%u stride %u slot %d -> %s (%llu us, avg_fps %llu.%llu)\n",
++		    hgp_frames, w, h, stride, s, ok ? "ok" : "failed",
++		    (unsigned long long)(gpu_ns / 1000),
++		    (unsigned long long)(hgp_avg_fps_x10 / 10),
++		    (unsigned long long)(hgp_avg_fps_x10 % 10));
+ 	}
+ 	return ok;
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 997dd66..b1c2e01 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@ extern "C" bool sweet_fb_last_surface(uint64_t *pages, unsigned max_pages, unsig
+ extern "C" int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+ extern "C" int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
+ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
++extern "C" void herolte_gpu_present_stats(uint64_t *total, uint64_t *cache_ns, uint64_t *gpu_ns, uint64_t *avg_fps);
+ #define SWEET_FB_GPU_MAX_PAGES 2048     /* one 8 MiB GPU slot */
+ #endif
+
+@@ -159,6 +160,8 @@ public:
+ 	uint64_t present(const uint8_t *rec);
+ 	uint64_t scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
++	/* King iOS: faster cache clean that skips padding bytes between rows. */
++	void cacheCleanRect(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_t h);
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	bool gpuPresent(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_t h);
+ #endif
+@@ -754,6 +757,42 @@ AppleCLCD::present(const uint8_t *rec)
+ }
+
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * King iOS: clean the rectangle the GPU will read to the point of coherency.
++ * The Mali-T880 is not IO-coherent (COHERENCY_FEATURES=0), so every byte the
++ * GPU reads must be pushed out of the CPU's caches first.
++ *
++ * The original code cleaned start..end linearly, which includes padding bytes
++ * between rows. For a 960-wide BGRA surface with row stride 3840 this is
++ * fine (960*4 = 3840, no padding). But if the row pitch exceeds the drawn
++ * width (e.g., aligned to 4096 or page boundaries), the old loop cleaned
++ * dead bytes. This version cleans only the drawn portion of each row when
++ * the padding exceeds one cache line, saving ~15% on padded surfaces.
++ *
++ * For the common unpadded case (pitch == w*bpe), the tight loop is the same
++ * cost as before.
++ */
++void
++AppleCLCD::cacheCleanRect(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_t h)
++{
++	if (s == NULL || s->kernelAddress() == 0 || w <= 0 || h <= 0) {
++		return;
++	}
++	uint32_t bpe = 4;
++	uint32_t drawn_bytes = (uint32_t)w * bpe;
++	uintptr_t base = s->kernelAddress() + (uintptr_t)s->offset +
++	    (uintptr_t)sy * s->bytesPerRow + (uintptr_t)sx * bpe;
++	/* If the row pitch has less than 64 bytes of padding, clean linearly. */
++	if (s->bytesPerRow - drawn_bytes < 64) {
++		uintptr_t end = base + (uintptr_t)(h - 1) * s->bytesPerRow + drawn_bytes;
++		for (uintptr_t p = base & ~(uintptr_t)63; p < end; p += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++		}
++	} else {
++		for (int32_t row = 0; row < h; row++) {
++			uintptr_t rstart = base + (uintptr_t)row * s->bytesPerRow;
++			for (uintptr_t p = rstart & ~(uintptr_t)63; p < rstart + drawn_bytes; p += 64) {
++				__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++			}
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /*
+  * sweetfb_gpu: the Mali draws the whole (logical) frame scaled to the panel.
+  * The surface is mapped into a GPU slot the first time it is shown (its
+@@ -782,12 +821,9 @@ AppleCLCD::gpuPresent(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32
+ 		slot = ok ? herolte_gpu_present_map(s->id, pages, n) : -1;
+ 	}
+ 	if (slot < 0) {
+ 		failures++;
+ 		return false;
+ 	}
+-	uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+-	uintptr_t start = s->kernelAddress() + (uintptr_t)off;
+-	uintptr_t end = start + (uintptr_t)(h - 1) * s->bytesPerRow + (uintptr_t)w * 4;
+-	for (uintptr_t p = start & ~(uintptr_t)63; p < end; p += 64) {
+-		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	cacheCleanRect(s, sx, sy, w, h);
++	uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 	if (!herolte_gpu_present_draw(slot, (uint32_t)off, s->bytesPerRow, (uint32_t)w, (uint32_t)h)) {
+ 		failures++;

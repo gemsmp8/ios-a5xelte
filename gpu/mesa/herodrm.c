@@ -671,6 +671,45 @@ herodrm_bo_sync(uint32_t handle)
    return kr ? fail(EINVAL) : 0;
 }
 
+/*
+ * King iOS: batch sync for multiple surfaces in a single kernel call.
+ * CoreAnimation composites from several IOSurfaces per frame (the app's
+ * layers, the status bar, wallpaper, etc.). Syncing each one individually
+ * has per-call overhead from the IOKit trap. This batches up to 8 handles
+ * in one round-trip when the kernel supports it (SEL 8), falling back to
+ * individual syncs otherwise.
+ */
+EXPORT int
+herodrm_bo_sync_batch(const uint32_t *handles, unsigned count)
+{
+   if (count == 0)
+      return 0;
+   if (count == 1)
+      return herodrm_bo_sync(handles[0]);
+   pthread_mutex_lock(&lock);
+   queue_drain();
+   int r = 0;
+   /* Try batch first: the kernel may not have the selector yet. */
+   if (count <= 8 && conn) {
+      uint64_t in[8] = {0};
+      for (unsigned i = 0; i < count; i++)
+         in[i] = handles[i];
+      uint32_t kr = call(8 /* SEL_SYNC_BATCH */, in, count, NULL, 0);
+      if (kr == 0) {
+         pthread_mutex_unlock(&lock);
+         return 0;
+      }
+      /* Selector not supported: fall back to individual syncs. */
+   }
+   for (unsigned i = 0; i < count; i++) {
+      uint64_t in = handles[i];
+      if (conn && call(SEL_SYNC_BO, &in, 1, NULL, 0))
+         r = -1;
+   }
+   pthread_mutex_unlock(&lock);
+   return r ? fail(EINVAL) : 0;
+}
+
 EXPORT int64_t
 herodrm_prime_size(int prime_fd)
 {
