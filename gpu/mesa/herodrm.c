@@ -51,7 +51,7 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO, SEL_SYNC_BATCH };
 
 #define MAX_BOS 4096
 
@@ -672,12 +672,12 @@ herodrm_bo_sync(uint32_t handle)
 }
 
 /*
- * King iOS: batch sync for multiple surfaces in a single kernel call.
- * CoreAnimation composites from several IOSurfaces per frame (the app's
- * layers, the status bar, wallpaper, etc.). Syncing each one individually
- * has per-call overhead from the IOKit trap. This batches up to 8 handles
- * in one round-trip when the kernel supports it (SEL 8), falling back to
- * individual syncs otherwise.
+ * Sync multiple surface BOs in one IOKit call (kernel selector 8,
+ * kHeroGPUSyncBatch in 0270). Each handle whose BO is a surface gets
+ * dc civac over the surface's pixels; non-surface or invalid handles
+ * are silently skipped by the kernel. Falls back to individual syncs
+ * when the kernel returns kIOReturnUnsupported (older kernel without
+ * 0270).
  */
 EXPORT int
 herodrm_bo_sync_batch(const uint32_t *handles, unsigned count)
@@ -688,22 +688,24 @@ herodrm_bo_sync_batch(const uint32_t *handles, unsigned count)
       return herodrm_bo_sync(handles[0]);
    pthread_mutex_lock(&lock);
    queue_drain();
-   int r = 0;
-   /* Try batch first: the kernel may not have the selector yet. */
-   if (count <= 8 && conn) {
-      uint64_t in[8] = {0};
-      for (unsigned i = 0; i < count; i++)
-         in[i] = handles[i];
-      uint32_t kr = call(8 /* SEL_SYNC_BATCH */, in, count, NULL, 0);
-      if (kr == 0) {
-         pthread_mutex_unlock(&lock);
-         return 0;
-      }
-      /* Selector not supported: fall back to individual syncs. */
+   if (!conn) {
+      pthread_mutex_unlock(&lock);
+      return fail(ENODEV);
    }
+   uint64_t in[8] = {0};
+   unsigned n = count <= 8 ? count : 8;
+   for (unsigned i = 0; i < n; i++)
+      in[i] = handles[i];
+   uint32_t kr = call(SEL_SYNC_BATCH, in, n, NULL, 0);
+   if (kr == 0) {
+      pthread_mutex_unlock(&lock);
+      return 0;
+   }
+   /* Fallback: kernel without kHeroGPUSyncBatch. */
+   int r = 0;
    for (unsigned i = 0; i < count; i++) {
-      uint64_t in = handles[i];
-      if (conn && call(SEL_SYNC_BO, &in, 1, NULL, 0))
+      uint64_t h = handles[i];
+      if (call(SEL_SYNC_BO, &h, 1, NULL, 0))
          r = -1;
    }
    pthread_mutex_unlock(&lock);

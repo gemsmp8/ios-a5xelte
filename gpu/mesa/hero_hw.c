@@ -34,8 +34,6 @@ struct herodrm_surface {
 };
 int herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info);
 int herodrm_bo_sync(uint32_t handle);
-int herodrm_bo_sync_batch(const uint32_t *handles, unsigned count);
-void herodrm_log(const char *fmt, ...);
 
 static struct pipe_screen *hero_screen;
 
@@ -72,6 +70,8 @@ hero_hw_create_screen(void)
    if (!screen)
       fprintf(stderr, "hero_hw: Panfrost screen creation failed, using softpipe\n");
    hero_screen = screen;
+   if (screen)
+      fprintf(stderr, "hero_hw: Panfrost screen created on Mali-T880 (herogl active)\n");
    return screen;
 }
 
@@ -204,31 +204,6 @@ hero_hw_surface_sync(uint32_t surface_id)
          break;
       }
    pthread_mutex_unlock(&surf_lock);
-}
-
-/*
- * King iOS: sync all surfaces that were drawn into this frame in one batch.
- * CoreAnimation composites from multiple IOSurfaces (app layers, status bar,
- * wallpaper) and each one needs its GPU writes flushed to memory before the
- * display controller reads them. Batching reduces IOKit call overhead.
- */
-void
-hero_hw_surface_sync_all_dirty(const uint32_t *ids, unsigned count)
-{
-   uint32_t handles[8];
-   unsigned n = 0;
-   pthread_mutex_lock(&surf_lock);
-   for (unsigned j = 0; j < count && n < 8; j++) {
-      for (int i = 0; i < MAX_SURF; i++) {
-         if (surfs[i].res && surfs[i].id == ids[j]) {
-            handles[n++] = surfs[i].handle;
-            break;
-         }
-      }
-   }
-   pthread_mutex_unlock(&surf_lock);
-   if (n > 0)
-      herodrm_bo_sync_batch(handles, n);
 }
 
 void
