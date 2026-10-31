@@ -121,6 +121,9 @@ OSMesaSweetBlit(GLuint name, int is_texture, uint32_t surface_id, int flip, int 
    hero_stats[2] += t2 - t1;
    hero_stats[3] += t3 - t2;
    hero_stats[4] += t4 - t3;
+   if (hero_stats[0] == 1)
+      fprintf(stderr, "hero_hw: first GPU blit to IOSurface %u (%ux%u, %.1f ms)\n",
+              surface_id, w, h, t4 - t0);
    return 1;
 }
 
@@ -154,7 +157,16 @@ OSMesaSweetAttachDirect(GLuint name, uint32_t surface_id)
    stimg.format = res->format;
    stimg.internalformat = GL_RGBA;
    st_bind_egl_image(ctx, t, img, &stimg, false, true);
-   return t->surface_based && t->pt == res;
+   if (t->surface_based && t->pt == res) {
+      static int hero_attach_log;
+      if (!hero_attach_log) {
+         hero_attach_log = 1;
+         fprintf(stderr, "hero_hw: first IOSurface %u attached as GPU render target (%ux%u)\n",
+                 surface_id, dw, dh);
+      }
+      return 1;
+   }
+   return 0;
 }
 
 GLAPI void GLAPIENTRY
