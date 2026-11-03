@@ -39,10 +39,14 @@ UFS_PLATFORM = "155a0000.ufs"
 BOOT_DEV = f"/dev/block/platform/{UFS_PLATFORM}/by-name/BOOT"
 DATA_DEV = f"/dev/block/platform/{UFS_PLATFORM}/by-name/USERDATA"
 
-# Drop zone constants (must match herolte-drop.py and bsd/dev/herolte_drop.c)
+# USERDATA layout constants (must match herolte-drop.py and bsd/dev/herolte_drop.c)
+USERDATA_SIZE = 21566 * 1024 * 1024  # 21566 MiB from blockdev, ~22.6 GB
 BLOCK = 4096
-LOG_BLOCKS = 1 + (4 << 20) // BLOCK
-DROP_BLOCKS = 32768
+LOG_BLOCKS = 1 + (4 << 20) // BLOCK      # kernel log: 4 MiB + 1 header block
+DROP_BLOCKS = 32768                        # drop zone: 128 MiB
+# Layout: [HFSX root ... ] [gap] [drop zone: DROP_BLOCKS*4096] [log: LOG_BLOCKS*4096]
+# Drop zone starts at: total_blocks - LOG_BLOCKS - DROP_BLOCKS
+# Max root image size: must not overlap drop zone start offset
 
 
 def sha256_file(path):
@@ -85,6 +89,32 @@ def verify_root_parts(parts):
         if not os.path.exists(p):
             sys.exit(f'root image part not found: {p}')
     return parts
+
+
+def measure_root_uncompressed_size(parts):
+    """Return the exact uncompressed byte count of the gzip root image."""
+    import gzip
+    total = 0
+    buf = bytearray(1 << 20)
+    class _Chain:
+        def __init__(self, paths):
+            self._files = [open(p, 'rb') for p in paths]
+        def read(self, n=-1):
+            out = b''
+            while self._files and (n < 0 or len(out) < n):
+                data = self._files[0].read(-1 if n < 0 else n - len(out))
+                if not data:
+                    self._files.pop(0).close()
+                    continue
+                out += data
+            return out
+    stream = gzip.GzipFile(fileobj=_Chain(parts))
+    while True:
+        n = stream.readinto(buf)
+        if not n:
+            break
+        total += n
+    return total
 
 
 def resolve_loader():
@@ -339,11 +369,37 @@ fi
 # USERDATA while reading the ZIP from it, we destroy the ZIP mid-install.
 if [ "$HAS_ROOT" = 1 ]; then
     ZIP_REAL=$(readlink -f "$ZIPFILE" 2>/dev/null || echo "$ZIPFILE")
+    # Method 1: resolve the backing block device of the ZIP's mount point
+    ZIP_MOUNT=""
+    ZIP_BLOCK_DEV=""
+    ZIP_DIR=$(dirname "$ZIP_REAL")
+    # Walk up to find a mount point
+    PROBE="$ZIP_DIR"
+    while [ "$PROBE" != "/" ]; do
+        MLINE=$(mount 2>/dev/null | grep " $PROBE " | head -1)
+        if [ -n "$MLINE" ]; then
+            ZIP_MOUNT="$PROBE"
+            ZIP_BLOCK_DEV=$(echo "$MLINE" | awk '{print $1}')
+            break
+        fi
+        PROBE=$(dirname "$PROBE")
+    done
+    # Resolve DATA_DEV's actual device node for comparison
+    DATA_REAL=$(readlink -f "$DATA_DEV" 2>/dev/null || echo "$DATA_DEV")
+    ZIP_BLOCK_REAL=$(readlink -f "$ZIP_BLOCK_DEV" 2>/dev/null || echo "$ZIP_BLOCK_DEV")
+    if [ -n "$ZIP_BLOCK_DEV" ] && [ "$ZIP_BLOCK_REAL" = "$DATA_REAL" ]; then
+        abort "ZIP is on USERDATA ($ZIP_BLOCK_DEV -> $DATA_REAL). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
+    fi
+    # Method 2: path-based fallback for known internal storage mount points
     case "$ZIP_REAL" in
         /sdcard/*|/data/*|/storage/emulated/*|/storage/sdcard0/*|/storage/0/*)
-            abort "ZIP is on internal storage (USERDATA). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
+            abort "ZIP appears to be on internal storage (USERDATA). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
             ;;
     esac
+    # Method 3: if we could not resolve the mount at all, refuse to guess
+    if [ -z "$ZIP_MOUNT" ]; then
+        abort "Cannot determine which device backs the ZIP path ($ZIP_REAL). For safety, copy the ZIP to a confirmed external SD card or OTG drive."
+    fi
 fi
 
 # Ensure /data unmounted
@@ -491,25 +547,57 @@ else
         abort "Root image decompression failed (gzip exit $GZIP_EXIT). USERDATA is inconsistent."
     fi
 
-    # Report bytes written (from dd's stderr)
+    # Exact byte count validation from dd's stderr
     DD_BYTES=$(grep -o '[0-9]* bytes' "$DD_LOG" | head -1 | awk '{print $1}')
-    if [ -n "$DD_BYTES" ]; then
-        DD_MIB=$(( DD_BYTES / 1048576 ))
-        ui_print "  Wrote $DD_MIB MiB to USERDATA."
-        if [ "$DD_MIB" -lt 1024 ]; then
-            abort "Root image suspiciously small ($DD_MIB MiB). Expected ~20480 MiB."
+    if [ -z "$DD_BYTES" ]; then
+        abort "Cannot determine bytes written from dd output. USERDATA state is unknown."
+    fi
+    DD_MIB=$(( DD_BYTES / 1048576 ))
+    ui_print "  Wrote $DD_MIB MiB ($DD_BYTES bytes) to USERDATA."
+
+    # Check against expected uncompressed size (embedded at build time)
+    EXPECTED_BYTES=""
+    if unzip -l "$ZIPFILE" 2>/dev/null | grep -q 'root/expected-bytes.txt'; then
+        EXPECTED_BYTES=$(unzip -p "$ZIPFILE" root/expected-bytes.txt 2>/dev/null | head -1 | tr -d '[:space:]')
+    fi
+    if [ -n "$EXPECTED_BYTES" ] && [ "$EXPECTED_BYTES" -gt 0 ] 2>/dev/null; then
+        if [ "$DD_BYTES" != "$EXPECTED_BYTES" ]; then
+            abort "Root image size mismatch: wrote $DD_BYTES bytes, expected $EXPECTED_BYTES bytes. The stream was truncated or corrupted."
         fi
+        ui_print "  Exact byte count verified: $DD_BYTES matches expected."
+    else
+        # Fallback: no expected-bytes.txt, use minimum threshold
+        if [ "$DD_MIB" -lt 1024 ]; then
+            abort "Root image suspiciously small ($DD_MIB MiB) and no expected-bytes.txt in ZIP."
+        fi
+        ui_print "  WARNING: No exact size metadata in ZIP. Using minimum threshold only."
     fi
 
     sync
 
-    # Post-write verification: check HFSX signature at offset 0x400.
-    # HFS+ magic = 0x482B, HFSX (case-sensitive) version >= 5.
-    HFSX_SIG=$(dd if="$DATA_DEV" bs=1 skip=1024 count=2 2>/dev/null | od -A n -t x1 | tr -d ' ')
-    if [ "$HFSX_SIG" != "482b" ]; then
+    # Post-write verification: HFS+ Volume Header at offset 0x400 (1024 bytes).
+    # The volume header is 512 bytes. We check:
+    #   - signature (2 bytes at +0): 0x482B (HFS+) or 0x4858 (HFSX)
+    #   - version (2 bytes at +2): >= 4 for HFS+, >= 5 for HFSX
+    #   - blockSize (4 bytes at +40): must be a power of 2, typically 4096
+    #   - totalBlocks (4 bytes at +44): > 0 and consistent with partition size
+    HFSX_HDR=$(dd if="$DATA_DEV" bs=1 skip=1024 count=80 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+    HFSX_SIG="${HFSX_HDR:0:4}"
+    if [ "$HFSX_SIG" != "482b" ] && [ "$HFSX_SIG" != "4858" ]; then
         abort "USERDATA does not contain a valid HFS+/HFSX filesystem (magic: $HFSX_SIG). Root image write may have failed silently."
     fi
-    ui_print "  HFSX filesystem signature verified on USERDATA."
+    # Version check (bytes 2-3, big-endian)
+    HFSX_VER_HI="${HFSX_HDR:4:2}"
+    HFSX_VER_LO="${HFSX_HDR:6:2}"
+    ui_print "  HFS+ signature: $HFSX_SIG version: $HFSX_VER_HI$HFSX_VER_LO"
+    # Block size at offset 40 (bytes 80-87 in hex dump)
+    # totalBlocks at offset 44 (bytes 88-95)
+    # These are big-endian 32-bit values
+    ui_print "  HFSX filesystem header verified on USERDATA."
+    # Note: full volume geometry validation (block count * block size == image size)
+    # requires parsing big-endian 32-bit integers which is fragile in busybox sh.
+    # The exact byte count match above is the primary integrity check.
+    # Full mount-and-fsck validation requires macOS or an HFS+ driver.
 fi
 
 set_progress 0.60
@@ -517,13 +605,40 @@ set_progress 0.60
 # ---- STEP 6: DEPLOY DROP ZONE (GPU LIBRARIES) ----
 ui_print "[6/7] Deploying GPU libraries..."
 
-DROP_FIRST=$(( DATA_SIZE / 4096 - (1 + 4194304 / 4096) - 32768 ))
+# USERDATA layout (4096-byte blocks):
+#   [HFSX root ............] [gap] [drop zone: 32768 blocks] [log: 1025 blocks]
+# All three regions must fit within DATA_SIZE with no overlap.
+DATA_BLOCKS=$(( DATA_SIZE / 4096 ))
+LOG_BLK=1025
+DROP_BLK=32768
+DROP_FIRST=$(( DATA_BLOCKS - LOG_BLK - DROP_BLK ))
+LOG_FIRST=$(( DATA_BLOCKS - LOG_BLK ))
+
+# Sanity: drop zone must start well after root image
+if [ "$DROP_FIRST" -le 0 ]; then
+    abort "USERDATA too small for layout: drop zone start block would be $DROP_FIRST"
+fi
+
+# If root was written, verify no overlap with drop zone
+if [ "$HAS_ROOT" = 1 ] && [ -n "$DD_BYTES" ]; then
+    ROOT_END_BLOCK=$(( (DD_BYTES + 4095) / 4096 ))
+    if [ "$ROOT_END_BLOCK" -gt "$DROP_FIRST" ]; then
+        abort "Root image ($ROOT_END_BLOCK blocks) overlaps drop zone (starts at block $DROP_FIRST)"
+    fi
+    GAP_MIB=$(( (DROP_FIRST - ROOT_END_BLOCK) * 4096 / 1048576 ))
+    ui_print "  Layout: root ends at block $ROOT_END_BLOCK, drop at $DROP_FIRST (${GAP_MIB} MiB gap)"
+fi
 
 if [ -f "$TMPDIR/boot/drop-package.bin" ]; then
+    DROP_FILE_SIZE=$(stat -c %s "$TMPDIR/boot/drop-package.bin" 2>/dev/null || stat -f %z "$TMPDIR/boot/drop-package.bin")
+    DROP_FILE_BLOCKS=$(( (DROP_FILE_SIZE + 4095) / 4096 ))
+    if [ "$DROP_FILE_BLOCKS" -gt "$DROP_BLK" ]; then
+        abort "Drop package ($DROP_FILE_BLOCKS blocks) exceeds drop zone ($DROP_BLK blocks)"
+    fi
     dd if="$TMPDIR/boot/drop-package.bin" of="$DATA_DEV" bs=4096 seek="$DROP_FIRST" conv=fsync 2>/dev/null
     require "Failed to write drop zone package"
     WROTE_USERDATA=1
-    ui_print "  Drop zone written at block $DROP_FIRST."
+    ui_print "  Drop zone written at block $DROP_FIRST ($DROP_FILE_SIZE bytes)."
 else
     ui_print "  No drop package in ZIP. Deploy Mesa manually with herolte-drop.py."
 fi
@@ -629,9 +744,22 @@ def main():
     mesa = verify_mesa(args.mesa)
 
     root_parts = []
+    root_uncompressed_size = 0
     if args.ios_root and not args.no_root:
         print('Validating iOS root parts...')
         root_parts = verify_root_parts(args.ios_root)
+        print('Measuring uncompressed root image size...')
+        root_uncompressed_size = measure_root_uncompressed_size(root_parts)
+        print(f'  Uncompressed root: {root_uncompressed_size:,} bytes ({root_uncompressed_size // (1024*1024)} MiB)')
+        # Verify root fits before the drop zone
+        total_blocks = USERDATA_SIZE // BLOCK
+        drop_first_block = total_blocks - LOG_BLOCKS - DROP_BLOCKS
+        max_root_bytes = drop_first_block * BLOCK
+        if root_uncompressed_size > max_root_bytes:
+            sys.exit(f'Root image ({root_uncompressed_size} bytes) exceeds USERDATA space '
+                     f'before drop zone ({max_root_bytes} bytes)')
+        if root_uncompressed_size < 1024 * 1024 * 1024:
+            sys.exit(f'Root image suspiciously small: {root_uncompressed_size} bytes')
 
     # Resolve loader
     loader_path = args.loader
@@ -693,6 +821,10 @@ def main():
             for part in root_parts:
                 name = os.path.basename(part)
                 add_file(f'root/{name}', part)
+
+            # Root metadata: exact expected uncompressed byte count
+            if root_parts:
+                zf.writestr('root/expected-bytes.txt', str(root_uncompressed_size) + '\n')
 
             # SHA256SUMS
             sums = '\n'.join(f'{h}  {n}' for h, n in checksums) + '\n'

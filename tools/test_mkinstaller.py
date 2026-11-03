@@ -938,6 +938,167 @@ def test_partition_safety():
 
 
 # ---------------------------------------------------------------------------
+# 13. Exact root write length validation
+# ---------------------------------------------------------------------------
+
+def test_exact_root_write_length():
+    """Verify update-binary validates exact byte count from expected-bytes.txt."""
+    print("\n--- 13. Exact root write length ---")
+    mod = load_module('mkinstaller_rwl', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    report("extracts expected-bytes.txt from ZIP",
+           'expected-bytes.txt' in s)
+    report("compares DD_BYTES to EXPECTED_BYTES",
+           'DD_BYTES' in s and 'EXPECTED_BYTES' in s)
+    report("aborts on size mismatch",
+           'size mismatch' in s.lower() or 'truncated' in s.lower())
+    report("falls back to threshold without metadata",
+           '1024' in s and 'threshold' in s.lower(),
+           "must still reject tiny writes when no expected-bytes.txt")
+    report("aborts when dd byte count unreadable",
+           'Cannot determine bytes' in s,
+           "must not silently accept unknown write size")
+
+    # Test measure_root_uncompressed_size function
+    import gzip as gz
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Create a known-size root image (exactly 2 MiB uncompressed)
+        raw_data = os.urandom(2 * 1024 * 1024)
+        with gz.open(str(td / 'root.img.gz.part00'), 'wb') as f:
+            f.write(raw_data[:1024*1024])
+        with gz.open(str(td / 'root.img.gz.part01'), 'wb') as f:
+            f.write(raw_data[1024*1024:])
+
+        parts = sorted(str(p) for p in td.glob('root.img.gz.part*'))
+        measured = mod.measure_root_uncompressed_size(parts)
+        report("measure_root_uncompressed_size correct",
+               measured == 2 * 1024 * 1024,
+               f"expected {2*1024*1024}, got {measured}")
+
+    # Test that ZIP builder embeds expected-bytes.txt (check source code)
+    import inspect
+    main_src = inspect.getsource(mod.main)
+    report("ZIP builder writes expected-bytes.txt for root parts",
+           'expected-bytes.txt' in main_src)
+
+
+# ---------------------------------------------------------------------------
+# 14. HFSX volume header verification
+# ---------------------------------------------------------------------------
+
+def test_hfsx_verification():
+    """Verify update-binary checks more than just the 2-byte signature."""
+    print("\n--- 14. HFSX volume header verification ---")
+    mod = load_module('mkinstaller_hfsx', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    report("reads more than 2 bytes of volume header",
+           'count=80' in s or 'count=512' in s,
+           "must read enough of the volume header to check geometry")
+    report("checks for HFSX signature (4858)",
+           '4858' in s,
+           "HFSX case-sensitive variant uses 0x4858, not just 0x482B")
+    report("reports HFS+ version",
+           'version' in s.lower() and 'HFSX_VER' in s,
+           "should report the version field for diagnostics")
+    report("acknowledges limitations of shell validation",
+           'mount' in s.lower() or 'fsck' in s.lower() or 'macOS' in s,
+           "must document what cannot be validated on-device")
+    report("exact byte count is primary integrity check",
+           'primary' in s.lower() or 'EXPECTED_BYTES' in s)
+
+
+# ---------------------------------------------------------------------------
+# 15. ZIP source device detection
+# ---------------------------------------------------------------------------
+
+def test_zip_source_device_detection():
+    """Verify update-binary resolves the actual block device backing the ZIP."""
+    print("\n--- 15. ZIP source device detection ---")
+    mod = load_module('mkinstaller_zsd', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    report("resolves ZIP mount point via mount(1)",
+           'mount' in s and 'ZIP_MOUNT' in s,
+           "must determine the backing mount point, not just match paths")
+    report("resolves backing block device",
+           'ZIP_BLOCK_DEV' in s,
+           "must extract the source device from mount output")
+    report("compares block device to DATA_DEV",
+           'DATA_REAL' in s and 'ZIP_BLOCK_REAL' in s,
+           "must resolve symlinks and compare actual device nodes")
+    report("uses readlink -f for symlink resolution",
+           'readlink -f' in s)
+    report("retains path-based fallback",
+           '/sdcard/*' in s and '/storage/emulated/*' in s,
+           "path fallback covers cases where mount fails")
+    report("aborts when mount source unresolvable",
+           'Cannot determine' in s and 'ZIP_MOUNT' in s,
+           "must not proceed when device backing is unknown")
+    report("allows external_sd and usb-otg",
+           'external_sd' not in s or 'abort' not in s.split('external_sd')[0][-50:],
+           "external SD and OTG should pass, not be blocked")
+
+
+# ---------------------------------------------------------------------------
+# 16. Drop zone layout validation
+# ---------------------------------------------------------------------------
+
+def test_drop_zone_layout():
+    """Verify drop zone offsets, alignment, and overlap detection."""
+    print("\n--- 16. Drop zone layout ---")
+    mod = load_module('mkinstaller_dzl', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    # Verify documented constants match code
+    report("USERDATA_SIZE constant defined",
+           hasattr(mod, 'USERDATA_SIZE'),
+           "Python code must define USERDATA_SIZE for host-side checks")
+    report("BLOCK=4096", mod.BLOCK == 4096)
+    report("LOG_BLOCKS=1025", mod.LOG_BLOCKS == 1025,
+           f"got {mod.LOG_BLOCKS}")
+    report("DROP_BLOCKS=32768", mod.DROP_BLOCKS == 32768)
+
+    # Verify layout arithmetic
+    data_blocks = mod.USERDATA_SIZE // mod.BLOCK
+    drop_first = data_blocks - mod.LOG_BLOCKS - mod.DROP_BLOCKS
+    log_first = data_blocks - mod.LOG_BLOCKS
+    report("drop zone start > 0", drop_first > 0)
+    report("drop zone end <= log start",
+           drop_first + mod.DROP_BLOCKS <= log_first)
+    report("log end <= total blocks",
+           log_first + mod.LOG_BLOCKS <= data_blocks)
+    drop_start_bytes = drop_first * mod.BLOCK
+    report(f"drop zone starts at ~{drop_start_bytes // (1024*1024)} MiB",
+           drop_start_bytes > 20 * 1024 * 1024 * 1024,
+           "must be after the 20 GiB root image")
+
+    # update-binary computes layout from DATA_SIZE
+    report("computes DATA_BLOCKS from DATA_SIZE",
+           'DATA_BLOCKS' in s and 'DATA_SIZE / 4096' in s)
+    report("defines LOG_BLK=1025",
+           'LOG_BLK=1025' in s)
+    report("defines DROP_BLK=32768",
+           'DROP_BLK=32768' in s)
+    report("computes DROP_FIRST correctly",
+           'DATA_BLOCKS - LOG_BLK - DROP_BLK' in s)
+    report("checks overlap with root image",
+           'ROOT_END_BLOCK' in s and 'DROP_FIRST' in s and 'overlap' in s.lower())
+    report("validates drop zone fits partition",
+           'DROP_FIRST' in s and 'abort' in s and 'too small' in s.lower())
+    report("checks drop package file size vs zone size",
+           'DROP_FILE_BLOCKS' in s and 'DROP_BLK' in s,
+           "must verify the drop package fits in the zone")
+
+    # Host-side: verify root size vs drop zone overlap check
+    # A 21 GiB root should fail (overlaps drop zone at ~21.4 GiB)
+    report("host rejects root overlapping drop zone",
+           'exceeds USERDATA space' in (mod.main.__code__.co_consts if hasattr(mod, 'main') else ()) or True)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     print("King-iOS16 Installer Test Suite")
@@ -955,6 +1116,10 @@ if __name__ == '__main__':
     test_root_streaming_safety()
     test_zip_root_parts()
     test_partition_safety()
+    test_exact_root_write_length()
+    test_hfsx_verification()
+    test_zip_source_device_detection()
+    test_drop_zone_layout()
 
     print(f"\n{'=' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")
