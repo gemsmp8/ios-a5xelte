@@ -150,8 +150,10 @@ def test_update_binary_structure():
 
     report("SM-G930F model check", 'SM-G930F' in s)
     report("UFS platform 155a0000.ufs check", '155a0000.ufs' in s)
-    report("no /sdcard backup", '/sdcard' not in s,
-           "/sdcard is on USERDATA which we erase")
+    report("no /sdcard backup writes", 'dd' not in s or 'of=/sdcard' not in s,
+           "/sdcard is on USERDATA; never write backups there")
+    report("detects ZIP on internal storage", '/sdcard/' in s and 'abort' in s,
+           "must abort if ZIP is on USERDATA")
     report("no hexdump", 'hexdump' not in s)
     report("no printf \\x byte writes", 'printf "\\x' not in s)
     report("uses pre-built xnu-boot.img", 'xnu-boot.img' in s)

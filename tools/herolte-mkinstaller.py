@@ -244,20 +244,36 @@ def build_drop_package(mesa_dir, workdir):
 UPDATE_BINARY = r'''#!/sbin/sh
 # King-iOS16-herolte TWRP installer
 # Galaxy S7 SM-G930F (Exynos 8890) - XNU / iOS 16.7.16
+#
+# Safety design:
+#   - Root parts are STREAMED from the ZIP via unzip -p, never extracted to /tmp.
+#   - If the ZIP lives on internal storage (/sdcard = USERDATA) and contains
+#     root parts, the install is aborted: writing USERDATA would destroy the ZIP.
+#   - BOOT is flashed LAST so an interrupted root write leaves Android intact.
+#   - abort() messages reflect whether destructive writes already happened.
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
 ui_print() { echo "ui_print $1" > "$OUTFD"; echo "ui_print" > "$OUTFD"; }
 set_progress() { echo "set_progress $1" > "$OUTFD"; }
-abort() { ui_print ""; ui_print "FATAL: $1"; ui_print "Installation aborted. No changes were made."; exit 1; }
 
-FAILED=0
-check() {
-    if [ $? -ne 0 ]; then
-        FAILED=1
-        ui_print "ERROR: $1"
+WROTE_USERDATA=0
+WROTE_BOOT=0
+
+abort() {
+    ui_print ""
+    ui_print "FATAL: $1"
+    if [ "$WROTE_USERDATA" = 1 ] || [ "$WROTE_BOOT" = 1 ]; then
+        ui_print "WARNING: Partial writes occurred before this failure."
+        [ "$WROTE_USERDATA" = 1 ] && ui_print "  USERDATA was modified (root/drop zone)."
+        [ "$WROTE_BOOT" = 1 ] && ui_print "  BOOT was modified."
+        ui_print "Recovery: flash stock BOOT from your backup, then Format Data in TWRP."
+    else
+        ui_print "Installation aborted. No changes were made."
     fi
+    exit 1
 }
+
 require() {
     if [ $? -ne 0 ]; then
         abort "$1"
@@ -269,7 +285,7 @@ ui_print " King iOS 16 for Galaxy S7 (SM-G930F)"
 ui_print "========================================"
 ui_print ""
 
-# ---- DEVICE VERIFICATION ----
+# ---- STEP 1: DEVICE VERIFICATION ----
 ui_print "[1/7] Verifying device..."
 
 MODEL=$(getprop ro.product.model 2>/dev/null)
@@ -297,22 +313,40 @@ ui_print "  BOOT: $BOOT_SIZE bytes  USERDATA: $DATA_SIZE bytes"
 
 set_progress 0.05
 
-# ---- BATTERY CHECK ----
-ui_print "[2/7] Checking battery..."
+# ---- STEP 2: PRE-FLIGHT CHECKS ----
+ui_print "[2/7] Pre-flight checks..."
+
+# Battery
 BATT=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo 100)
 if [ "$BATT" -lt 25 ]; then
     abort "Battery too low: ${BATT}%. Charge to at least 25% before installing."
 fi
 ui_print "  Battery: ${BATT}%"
 
-# ---- STORAGE CHECK ----
+# Storage
 if [ "$DATA_SIZE" -lt 20000000000 ]; then
     abort "USERDATA too small: $DATA_SIZE bytes (need >= 20 GB for iOS root)"
 fi
 
-set_progress 0.08
+# Check if ZIP contains root parts
+HAS_ROOT=0
+if unzip -l "$ZIPFILE" 2>/dev/null | grep -q 'root/root\.img\.gz\.part'; then
+    HAS_ROOT=1
+fi
 
-# ---- ENSURE /data UNMOUNTED ----
+# If root parts exist, check if the ZIP is on USERDATA (internal storage).
+# On the S7, /sdcard /data /data/media all live on USERDATA. If we write
+# USERDATA while reading the ZIP from it, we destroy the ZIP mid-install.
+if [ "$HAS_ROOT" = 1 ]; then
+    ZIP_REAL=$(readlink -f "$ZIPFILE" 2>/dev/null || echo "$ZIPFILE")
+    case "$ZIP_REAL" in
+        /sdcard/*|/data/*|/storage/emulated/*)
+            abort "ZIP is on internal storage (USERDATA). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
+            ;;
+    esac
+fi
+
+# Ensure /data unmounted
 if mount | grep -q ' /data '; then
     ui_print "  Unmounting /data..."
     umount /data 2>/dev/null || abort "Cannot unmount /data. Use TWRP Mount menu to unmount it first."
@@ -320,12 +354,18 @@ fi
 
 set_progress 0.10
 
-# ---- EXTRACT AND VERIFY ZIP ----
-ui_print "[3/7] Extracting and verifying..."
+# ---- STEP 3: EXTRACT SMALL FILES AND VERIFY INTEGRITY ----
+ui_print "[3/7] Extracting metadata and verifying..."
 TMPDIR=/tmp/king-ios
 rm -rf "$TMPDIR"
 mkdir -p "$TMPDIR"
-unzip -o "$ZIPFILE" -d "$TMPDIR" || abort "Failed to extract ZIP"
+
+# Extract ONLY small files (boot/, mesa/, SHA256SUMS). NOT root/ parts.
+unzip -o "$ZIPFILE" 'boot/*' 'mesa/*' 'SHA256SUMS' -d "$TMPDIR" 2>/dev/null
+if [ $? -ne 0 ] && [ $? -ne 11 ]; then
+    # exit 11 = "no matching files" which is OK if some categories are absent
+    abort "Failed to extract metadata from ZIP"
+fi
 
 cd "$TMPDIR"
 if [ -f SHA256SUMS ]; then
@@ -334,6 +374,8 @@ if [ -f SHA256SUMS ]; then
         while IFS= read -r line; do
             hash=$(echo "$line" | awk '{print $1}')
             file=$(echo "$line" | awk '{print $2}')
+            # Only verify files we extracted (skip root/ parts)
+            case "$file" in root/*) continue ;; esac
             if [ -f "$file" ]; then
                 actual=$(sha256sum "$file" | awk '{print $1}')
                 if [ "$hash" != "$actual" ]; then
@@ -342,6 +384,19 @@ if [ -f SHA256SUMS ]; then
                 fi
             fi
         done < SHA256SUMS
+        # Verify root parts by streaming from ZIP (no extraction needed)
+        if [ "$HAS_ROOT" = 1 ]; then
+            while IFS= read -r line; do
+                hash=$(echo "$line" | awk '{print $1}')
+                file=$(echo "$line" | awk '{print $2}')
+                case "$file" in root/*) ;; *) continue ;; esac
+                actual=$(unzip -p "$ZIPFILE" "$file" 2>/dev/null | sha256sum | awk '{print $1}')
+                if [ "$hash" != "$actual" ]; then
+                    ui_print "  CORRUPT: $file"
+                    FAIL=1
+                fi
+            done < SHA256SUMS
+        fi
         if [ "$FAIL" = 1 ]; then
             abort "File integrity check failed -- ZIP is corrupt or tampered."
         fi
@@ -353,11 +408,7 @@ fi
 
 set_progress 0.15
 
-# ---- VERIFY BOOT STOCK HASH ----
-# The ZIP carries the SHA-256 of the stock BOOT that was used to build the
-# XNU boot image. The user must have backed up their stock BOOT externally
-# (via ADB from TWRP) BEFORE running this installer. We verify the current
-# BOOT matches, so we know the pre-built xnu-boot.img is compatible.
+# ---- STEP 4: VERIFY BOOT COMPATIBILITY ----
 ui_print "[4/7] Verifying BOOT compatibility..."
 if [ -f boot/boot-stock-sha256.txt ]; then
     EXPECTED_SHA=$(cat boot/boot-stock-sha256.txt | awk '{print $1}')
@@ -379,28 +430,39 @@ fi
 
 set_progress 0.20
 
-# ---- WRITE iOS ROOT TO USERDATA ----
+# ---- STEP 5: WRITE iOS ROOT TO USERDATA (streamed from ZIP) ----
 ui_print "[5/7] Writing iOS root to USERDATA..."
-ui_print "  WARNING: This ERASES all data on USERDATA."
-ui_print ""
 
-ROOT_PARTS=$(ls "$TMPDIR"/root/root.img.gz.part* 2>/dev/null)
-if [ -z "$ROOT_PARTS" ]; then
+if [ "$HAS_ROOT" = 0 ]; then
     ui_print "  No iOS root in ZIP. Flash separately with herolte-flash-root.py."
     ui_print "  Skipping USERDATA write."
 else
-    ui_print "  Decompressing and writing root image..."
-    cat $ROOT_PARTS | gzip -dc | dd of="$DATA_DEV" bs=1048576 conv=fsync 2>/dev/null
-    if [ $? -ne 0 ]; then
-        abort "Root image write FAILED. USERDATA may be inconsistent. Re-flash with herolte-flash-root.py from a PC."
+    ui_print "  WARNING: This ERASES all data on USERDATA."
+    ui_print "  Streaming root image from ZIP..."
+
+    # List root parts in sorted order from the ZIP
+    ROOT_LIST=$(unzip -l "$ZIPFILE" 2>/dev/null | grep 'root/root\.img\.gz\.part' | awk '{print $NF}' | sort)
+    if [ -z "$ROOT_LIST" ]; then
+        abort "Root parts listed but cannot be enumerated from ZIP"
     fi
+
+    # Stream: unzip -p extracts to stdout. Concatenate all parts, decompress,
+    # write directly to the block device. No /tmp usage for the ~6 GB payload.
+    # shellcheck disable=SC2086
+    unzip -p "$ZIPFILE" $ROOT_LIST 2>/dev/null | gzip -dc | dd of="$DATA_DEV" bs=1048576 conv=fsync 2>/dev/null
+    PIPE_STATUS=$?
+    if [ "$PIPE_STATUS" -ne 0 ]; then
+        WROTE_USERDATA=1
+        abort "Root image write FAILED (exit $PIPE_STATUS). USERDATA may be inconsistent. Re-flash with herolte-flash-root.py from a PC."
+    fi
+    WROTE_USERDATA=1
     sync
-    ui_print "  Root image written."
+    ui_print "  Root image written to USERDATA."
 fi
 
 set_progress 0.60
 
-# ---- DEPLOY DROP ZONE (GPU LIBRARIES) ----
+# ---- STEP 6: DEPLOY DROP ZONE (GPU LIBRARIES) ----
 ui_print "[6/7] Deploying GPU libraries..."
 
 DROP_FIRST=$(( DATA_SIZE / 4096 - (1 + 4194304 / 4096) - 32768 ))
@@ -408,14 +470,15 @@ DROP_FIRST=$(( DATA_SIZE / 4096 - (1 + 4194304 / 4096) - 32768 ))
 if [ -f "$TMPDIR/boot/drop-package.bin" ]; then
     dd if="$TMPDIR/boot/drop-package.bin" of="$DATA_DEV" bs=4096 seek="$DROP_FIRST" conv=fsync 2>/dev/null
     require "Failed to write drop zone package"
-    ui_print "  Drop zone written."
+    WROTE_USERDATA=1
+    ui_print "  Drop zone written at block $DROP_FIRST."
 else
     ui_print "  No drop package in ZIP. Deploy Mesa manually with herolte-drop.py."
 fi
 
 set_progress 0.70
 
-# ---- FLASH PRE-BUILT XNU BOOT IMAGE ----
+# ---- STEP 7: FLASH BOOT (LAST -- safest ordering) ----
 ui_print "[7/7] Flashing XNU BOOT..."
 
 XNU_BOOT="$TMPDIR/boot/xnu-boot.img"
@@ -443,8 +506,10 @@ READ_BYTES=$(( (XNU_BOOT_SIZE + 1048575) / 1048576 * 1048576 ))
 READBACK_SHA=$(dd if="$BOOT_DEV" bs=1048576 count=$(( READ_BYTES / 1048576 )) 2>/dev/null | head -c "$XNU_BOOT_SIZE" | sha256sum | awk '{print $1}')
 
 if [ "$WRITTEN_SHA" != "$READBACK_SHA" ]; then
+    WROTE_BOOT=1
     abort "BOOT readback verification FAILED. Written: $WRITTEN_SHA Readback: $READBACK_SHA"
 fi
+WROTE_BOOT=1
 ui_print "  BOOT written and verified ($XNU_BOOT_SIZE bytes)."
 
 set_progress 0.95
