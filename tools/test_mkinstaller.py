@@ -938,33 +938,48 @@ def test_partition_safety():
 
 
 # ---------------------------------------------------------------------------
-# 13. Exact root write length validation
+# 13. Exact root write length validation (mandatory metadata)
 # ---------------------------------------------------------------------------
 
 def test_exact_root_write_length():
-    """Verify update-binary validates exact byte count from expected-bytes.txt."""
-    print("\n--- 13. Exact root write length ---")
+    """Verify update-binary requires expected-bytes.txt and rejects missing/bad values."""
+    print("\n--- 13. Exact root write length (mandatory) ---")
     mod = load_module('mkinstaller_rwl', TOOLS / 'herolte-mkinstaller.py')
     s = mod.UPDATE_BINARY
 
-    report("extracts expected-bytes.txt from ZIP",
-           'expected-bytes.txt' in s)
-    report("compares DD_BYTES to EXPECTED_BYTES",
-           'DD_BYTES' in s and 'EXPECTED_BYTES' in s)
+    # Mandatory metadata: must abort if missing
+    report("aborts on missing expected-bytes.txt",
+           'Missing root/expected-bytes.txt' in s)
+    report("aborts on malformed value",
+           'Malformed expected-bytes.txt' in s or 'not a number' in s)
+    report("aborts if value < 1 GiB",
+           '1073741824' in s,
+           "must reject unreasonably small expected size")
+    report("aborts if value > DATA_SIZE",
+           'exceeds USERDATA capacity' in s)
+
+    # Validation happens BEFORE the streaming pipeline
+    metadata_check_pos = s.find('Missing root/expected-bytes.txt')
+    pipeline_pos = s.find('unzip -p "$ZIPFILE" $ROOT_LIST')
+    report("metadata validated before pipeline starts",
+           0 < metadata_check_pos < pipeline_pos,
+           "must abort before any writes if metadata missing")
+
+    # Post-write: exact match, no fallback
+    report("compares DD_BYTES == EXPECTED_BYTES",
+           'DD_BYTES" != "$EXPECTED_BYTES"' in s)
+    report("no 1 GiB fallback threshold after write",
+           'threshold' not in s.lower(),
+           "no fallback: expected-bytes.txt is mandatory")
     report("aborts on size mismatch",
-           'size mismatch' in s.lower() or 'truncated' in s.lower())
-    report("falls back to threshold without metadata",
-           '1024' in s and 'threshold' in s.lower(),
-           "must still reject tiny writes when no expected-bytes.txt")
+           'size mismatch' in s.lower())
     report("aborts when dd byte count unreadable",
-           'Cannot determine bytes' in s,
-           "must not silently accept unknown write size")
+           'Cannot determine bytes' in s)
 
     # Test measure_root_uncompressed_size function
     import gzip as gz
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        # Create a known-size root image (exactly 2 MiB uncompressed)
         raw_data = os.urandom(2 * 1024 * 1024)
         with gz.open(str(td / 'root.img.gz.part00'), 'wb') as f:
             f.write(raw_data[:1024*1024])
@@ -982,6 +997,13 @@ def test_exact_root_write_length():
     main_src = inspect.getsource(mod.main)
     report("ZIP builder writes expected-bytes.txt for root parts",
            'expected-bytes.txt' in main_src)
+
+    # Verify no path from HAS_ROOT=1 to dd of=DATA_DEV without expected-bytes.txt check
+    # The expected-bytes validation and the abort are between HAS_ROOT and the pipeline.
+    has_root_pos = s.find("if [ \"$HAS_ROOT\" = 0 ]")
+    report("expected-bytes check guards all root write paths",
+           metadata_check_pos < pipeline_pos,
+           "missing metadata must abort before streaming")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,35 +1033,66 @@ def test_hfsx_verification():
 
 
 # ---------------------------------------------------------------------------
-# 15. ZIP source device detection
+# 15. ZIP source device detection (block-device mandatory)
 # ---------------------------------------------------------------------------
 
 def test_zip_source_device_detection():
-    """Verify update-binary resolves the actual block device backing the ZIP."""
+    """Verify update-binary requires block device resolution for ZIP source."""
     print("\n--- 15. ZIP source device detection ---")
     mod = load_module('mkinstaller_zsd', TOOLS / 'herolte-mkinstaller.py')
     s = mod.UPDATE_BINARY
 
-    report("resolves ZIP mount point via mount(1)",
-           'mount' in s and 'ZIP_MOUNT' in s,
-           "must determine the backing mount point, not just match paths")
-    report("resolves backing block device",
-           'ZIP_BLOCK_DEV' in s,
-           "must extract the source device from mount output")
-    report("compares block device to DATA_DEV",
-           'DATA_REAL' in s and 'ZIP_BLOCK_REAL' in s,
-           "must resolve symlinks and compare actual device nodes")
-    report("uses readlink -f for symlink resolution",
-           'readlink -f' in s)
-    report("retains path-based fallback",
-           '/sdcard/*' in s and '/storage/emulated/*' in s,
-           "path fallback covers cases where mount fails")
-    report("aborts when mount source unresolvable",
-           'Cannot determine' in s and 'ZIP_MOUNT' in s,
-           "must not proceed when device backing is unknown")
-    report("allows external_sd and usb-otg",
-           'external_sd' not in s or 'abort' not in s.split('external_sd')[0][-50:],
-           "external SD and OTG should pass, not be blocked")
+    # Both ZIP path and DATA_DEV must resolve through readlink -f
+    report("resolves ZIP path with readlink -f",
+           'readlink -f "$ZIPFILE"' in s)
+    report("aborts if ZIP path unresolvable",
+           'Cannot resolve ZIP path' in s)
+    report("resolves DATA_DEV with readlink -f",
+           'readlink -f "$DATA_DEV"' in s)
+    report("aborts if DATA_DEV unresolvable",
+           'Cannot resolve USERDATA device' in s)
+
+    # Mount point must be found
+    report("walks directory tree for mount point",
+           'dirname' in s and 'PROBE' in s and 'mount' in s)
+    report("aborts if mount point not found",
+           'Mount point resolution failed' in s)
+
+    # Backing block device must resolve
+    report("resolves ZIP block device symlinks",
+           'readlink -f "$ZIP_BLOCK_DEV"' in s)
+    report("aborts if block device unresolvable",
+           'Cannot resolve ZIP backing device' in s)
+
+    # Device comparison is the primary check
+    report("compares resolved block devices",
+           'ZIP_BLOCK_REAL" = "$DATA_REAL"' in s)
+    report("aborts when devices match",
+           'ZIP is on USERDATA' in s and 'abort' in s)
+
+    # Path-based check is secondary defense, not primary acceptance
+    report("path check is defensive only",
+           'known internal storage location' in s or
+           'even though device comparison passed' in s,
+           "paths must not be accepted as sole proof of external storage")
+
+    # Verify that all three resolution steps happen before the path case statement
+    readlink_pos = s.find('readlink -f "$ZIPFILE"')
+    mount_walk_pos = s.find('PROBE=$(dirname')
+    device_compare_pos = s.find('ZIP_BLOCK_REAL" = "$DATA_REAL"')
+    path_case_pos = s.find('/sdcard/*|/data/*')
+    report("device check before path check",
+           0 < device_compare_pos < path_case_pos,
+           "block device comparison must precede path-based fallback")
+
+    # Logs the resolution for debugging
+    report("logs ZIP location and devices",
+           'ZIP location' in s and 'ZIP mount' in s and 'USERDATA device' in s)
+
+    # External SD and OTG are allowed (no abort for /external_sd or /usb-otg paths)
+    report("does not block external SD paths",
+           '/external_sd' not in s or 'abort' not in s[s.find('/external_sd')-100:s.find('/external_sd')],
+           "external_sd and usb-otg must pass device check, not be blocked by path")
 
 
 # ---------------------------------------------------------------------------

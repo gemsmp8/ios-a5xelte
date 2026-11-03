@@ -364,19 +364,31 @@ if unzip -l "$ZIPFILE" 2>/dev/null | grep -q 'root/root\.img\.gz\.part'; then
     HAS_ROOT=1
 fi
 
-# If root parts exist, check if the ZIP is on USERDATA (internal storage).
+# If root parts exist, verify the ZIP is NOT on USERDATA.
 # On the S7, /sdcard /data /data/media all live on USERDATA. If we write
 # USERDATA while reading the ZIP from it, we destroy the ZIP mid-install.
+#
+# Strategy: resolve the block device backing the ZIP's mount point and
+# compare it against USERDATA's block device. Both must resolve successfully.
+# Path names alone are never accepted as proof of external storage.
 if [ "$HAS_ROOT" = 1 ]; then
-    ZIP_REAL=$(readlink -f "$ZIPFILE" 2>/dev/null || echo "$ZIPFILE")
-    # Method 1: resolve the backing block device of the ZIP's mount point
+    ZIP_REAL=$(readlink -f "$ZIPFILE" 2>/dev/null)
+    if [ -z "$ZIP_REAL" ]; then
+        abort "Cannot resolve ZIP path ($ZIPFILE). readlink -f failed."
+    fi
+
+    # Resolve USERDATA's actual device node
+    DATA_REAL=$(readlink -f "$DATA_DEV" 2>/dev/null)
+    if [ -z "$DATA_REAL" ]; then
+        abort "Cannot resolve USERDATA device ($DATA_DEV). readlink -f failed."
+    fi
+
+    # Walk up the ZIP's directory tree to find the mount point
     ZIP_MOUNT=""
     ZIP_BLOCK_DEV=""
-    ZIP_DIR=$(dirname "$ZIP_REAL")
-    # Walk up to find a mount point
-    PROBE="$ZIP_DIR"
+    PROBE=$(dirname "$ZIP_REAL")
     while [ "$PROBE" != "/" ]; do
-        MLINE=$(mount 2>/dev/null | grep " $PROBE " | head -1)
+        MLINE=$(mount 2>/dev/null | grep " on $PROBE " | head -1)
         if [ -n "$MLINE" ]; then
             ZIP_MOUNT="$PROBE"
             ZIP_BLOCK_DEV=$(echo "$MLINE" | awk '{print $1}')
@@ -384,22 +396,43 @@ if [ "$HAS_ROOT" = 1 ]; then
         fi
         PROBE=$(dirname "$PROBE")
     done
-    # Resolve DATA_DEV's actual device node for comparison
-    DATA_REAL=$(readlink -f "$DATA_DEV" 2>/dev/null || echo "$DATA_DEV")
-    ZIP_BLOCK_REAL=$(readlink -f "$ZIP_BLOCK_DEV" 2>/dev/null || echo "$ZIP_BLOCK_DEV")
-    if [ -n "$ZIP_BLOCK_DEV" ] && [ "$ZIP_BLOCK_REAL" = "$DATA_REAL" ]; then
-        abort "ZIP is on USERDATA ($ZIP_BLOCK_DEV -> $DATA_REAL). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
+
+    # Also check root mount as last resort
+    if [ -z "$ZIP_MOUNT" ]; then
+        MLINE=$(mount 2>/dev/null | grep " on / " | head -1)
+        if [ -n "$MLINE" ]; then
+            ZIP_MOUNT="/"
+            ZIP_BLOCK_DEV=$(echo "$MLINE" | awk '{print $1}')
+        fi
     fi
-    # Method 2: path-based fallback for known internal storage mount points
+
+    if [ -z "$ZIP_MOUNT" ] || [ -z "$ZIP_BLOCK_DEV" ]; then
+        abort "Cannot determine which block device backs the ZIP path ($ZIP_REAL). Mount point resolution failed. Copy the ZIP to an external SD card or OTG drive."
+    fi
+
+    # Resolve the ZIP's backing device through symlinks
+    ZIP_BLOCK_REAL=$(readlink -f "$ZIP_BLOCK_DEV" 2>/dev/null)
+    if [ -z "$ZIP_BLOCK_REAL" ]; then
+        abort "Cannot resolve ZIP backing device ($ZIP_BLOCK_DEV). readlink -f failed. Copy the ZIP to an external SD card or OTG drive."
+    fi
+
+    ui_print "  ZIP location: $ZIP_REAL"
+    ui_print "  ZIP mount: $ZIP_MOUNT ($ZIP_BLOCK_DEV -> $ZIP_BLOCK_REAL)"
+    ui_print "  USERDATA device: $DATA_DEV -> $DATA_REAL"
+
+    if [ "$ZIP_BLOCK_REAL" = "$DATA_REAL" ]; then
+        abort "ZIP is on USERDATA ($ZIP_BLOCK_DEV -> $DATA_REAL). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive."
+    fi
+
+    # Secondary check: reject known internal-storage paths even if the device
+    # comparison passed (defensive against mount table bugs or bind mounts)
     case "$ZIP_REAL" in
         /sdcard/*|/data/*|/storage/emulated/*|/storage/sdcard0/*|/storage/0/*)
-            abort "ZIP appears to be on internal storage (USERDATA). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
+            abort "ZIP path ($ZIP_REAL) is a known internal storage location even though device comparison passed. This is unexpected. Copy the ZIP to an external SD card or OTG drive."
             ;;
     esac
-    # Method 3: if we could not resolve the mount at all, refuse to guess
-    if [ -z "$ZIP_MOUNT" ]; then
-        abort "Cannot determine which device backs the ZIP path ($ZIP_REAL). For safety, copy the ZIP to a confirmed external SD card or OTG drive."
-    fi
+
+    ui_print "  ZIP confirmed on separate device from USERDATA."
 fi
 
 # Ensure /data unmounted
@@ -516,6 +549,28 @@ else
         EXPECTED=$(( EXPECTED + 1 ))
     done
 
+    # Mandatory: extract expected uncompressed size before any writes.
+    # This file is generated at build time by measure_root_uncompressed_size().
+    EXPECTED_BYTES=""
+    if unzip -l "$ZIPFILE" 2>/dev/null | grep -q 'root/expected-bytes.txt'; then
+        EXPECTED_BYTES=$(unzip -p "$ZIPFILE" root/expected-bytes.txt 2>/dev/null | head -1 | tr -d '[:space:]')
+    fi
+    if [ -z "$EXPECTED_BYTES" ]; then
+        abort "Missing root/expected-bytes.txt in ZIP. This installer was not built correctly. Rebuild with the latest herolte-mkinstaller.py."
+    fi
+    # Validate the value is a reasonable positive integer
+    case "$EXPECTED_BYTES" in
+        ''|*[!0-9]*) abort "Malformed expected-bytes.txt: '$EXPECTED_BYTES' is not a number." ;;
+    esac
+    if [ "$EXPECTED_BYTES" -lt 1073741824 ]; then
+        abort "expected-bytes.txt value $EXPECTED_BYTES is < 1 GiB. Root image too small to be valid."
+    fi
+    if [ "$EXPECTED_BYTES" -gt "$DATA_SIZE" ]; then
+        abort "expected-bytes.txt value $EXPECTED_BYTES exceeds USERDATA capacity $DATA_SIZE."
+    fi
+    EXPECTED_MIB=$(( EXPECTED_BYTES / 1048576 ))
+    ui_print "  Expected root image: $EXPECTED_MIB MiB ($EXPECTED_BYTES bytes)"
+
     # Stream root to USERDATA. TWRP's sh (busybox ash) has no pipefail,
     # so we cannot detect mid-pipe failures from the pipeline exit code
     # alone. Instead we:
@@ -555,23 +610,12 @@ else
     DD_MIB=$(( DD_BYTES / 1048576 ))
     ui_print "  Wrote $DD_MIB MiB ($DD_BYTES bytes) to USERDATA."
 
-    # Check against expected uncompressed size (embedded at build time)
-    EXPECTED_BYTES=""
-    if unzip -l "$ZIPFILE" 2>/dev/null | grep -q 'root/expected-bytes.txt'; then
-        EXPECTED_BYTES=$(unzip -p "$ZIPFILE" root/expected-bytes.txt 2>/dev/null | head -1 | tr -d '[:space:]')
+    # Exact byte count verification against mandatory expected-bytes.txt
+    # (EXPECTED_BYTES was validated before streaming began)
+    if [ "$DD_BYTES" != "$EXPECTED_BYTES" ]; then
+        abort "Root image size mismatch: wrote $DD_BYTES bytes, expected $EXPECTED_BYTES bytes. The stream was truncated or corrupted."
     fi
-    if [ -n "$EXPECTED_BYTES" ] && [ "$EXPECTED_BYTES" -gt 0 ] 2>/dev/null; then
-        if [ "$DD_BYTES" != "$EXPECTED_BYTES" ]; then
-            abort "Root image size mismatch: wrote $DD_BYTES bytes, expected $EXPECTED_BYTES bytes. The stream was truncated or corrupted."
-        fi
-        ui_print "  Exact byte count verified: $DD_BYTES matches expected."
-    else
-        # Fallback: no expected-bytes.txt, use minimum threshold
-        if [ "$DD_MIB" -lt 1024 ]; then
-            abort "Root image suspiciously small ($DD_MIB MiB) and no expected-bytes.txt in ZIP."
-        fi
-        ui_print "  WARNING: No exact size metadata in ZIP. Using minimum threshold only."
-    fi
+    ui_print "  Exact byte count verified: $DD_BYTES == $EXPECTED_BYTES"
 
     sync
 
