@@ -340,7 +340,7 @@ fi
 if [ "$HAS_ROOT" = 1 ]; then
     ZIP_REAL=$(readlink -f "$ZIPFILE" 2>/dev/null || echo "$ZIPFILE")
     case "$ZIP_REAL" in
-        /sdcard/*|/data/*|/storage/emulated/*)
+        /sdcard/*|/data/*|/storage/emulated/*|/storage/sdcard0/*|/storage/0/*)
             abort "ZIP is on internal storage (USERDATA). Writing the iOS root would destroy the ZIP mid-install. Copy the ZIP to an external SD card or OTG drive and install from there."
             ;;
     esac
@@ -446,18 +446,70 @@ else
         abort "Root parts listed but cannot be enumerated from ZIP"
     fi
 
-    # Stream: unzip -p extracts to stdout. Concatenate all parts, decompress,
-    # write directly to the block device. No /tmp usage for the ~6 GB payload.
+    # Verify parts are contiguous (part00, part01, part02 -- no gaps).
+    PART_COUNT=$(echo "$ROOT_LIST" | wc -l)
+    ui_print "  Found $PART_COUNT root image part(s)."
+    EXPECTED=0
+    for p in $ROOT_LIST; do
+        SUFFIX=$(echo "$p" | sed 's/.*part//')
+        NUM=$(echo "$SUFFIX" | sed 's/^0*//' )
+        [ -z "$NUM" ] && NUM=0
+        if [ "$NUM" != "$EXPECTED" ]; then
+            abort "Root parts are not contiguous: expected part$(printf '%02d' $EXPECTED), sequence jumps to part$SUFFIX"
+        fi
+        EXPECTED=$(( EXPECTED + 1 ))
+    done
+
+    # Stream root to USERDATA. TWRP's sh (busybox ash) has no pipefail,
+    # so we cannot detect mid-pipe failures from the pipeline exit code
+    # alone. Instead we:
+    #   1. Capture dd's byte count from stderr.
+    #   2. Check each pipe component via named status files.
+    #   3. Verify HFSX magic on USERDATA after writing.
+    DD_LOG=/tmp/king-ios-dd.log
+    UNZIP_RC=/tmp/king-ios-unzip-rc
+    GZIP_RC=/tmp/king-ios-gzip-rc
+
     # shellcheck disable=SC2086
-    unzip -p "$ZIPFILE" $ROOT_LIST 2>/dev/null | gzip -dc | dd of="$DATA_DEV" bs=1048576 conv=fsync 2>/dev/null
-    PIPE_STATUS=$?
-    if [ "$PIPE_STATUS" -ne 0 ]; then
-        WROTE_USERDATA=1
-        abort "Root image write FAILED (exit $PIPE_STATUS). USERDATA may be inconsistent. Re-flash with herolte-flash-root.py from a PC."
-    fi
+    { unzip -p "$ZIPFILE" $ROOT_LIST 2>/dev/null; echo $? > "$UNZIP_RC"; } | \
+    { gzip -dc; echo $? > "$GZIP_RC"; } | \
+    dd of="$DATA_DEV" bs=1048576 conv=fsync 2>"$DD_LOG"
+    DD_STATUS=$?
+
     WROTE_USERDATA=1
+
+    if [ "$DD_STATUS" -ne 0 ]; then
+        abort "Root image dd write FAILED (exit $DD_STATUS). USERDATA is inconsistent. Re-flash with herolte-flash-root.py from a PC."
+    fi
+
+    UNZIP_EXIT=$(cat "$UNZIP_RC" 2>/dev/null || echo 99)
+    GZIP_EXIT=$(cat "$GZIP_RC" 2>/dev/null || echo 99)
+    if [ "$UNZIP_EXIT" != "0" ]; then
+        abort "Root image extraction failed (unzip exit $UNZIP_EXIT). USERDATA is inconsistent."
+    fi
+    if [ "$GZIP_EXIT" != "0" ]; then
+        abort "Root image decompression failed (gzip exit $GZIP_EXIT). USERDATA is inconsistent."
+    fi
+
+    # Report bytes written (from dd's stderr)
+    DD_BYTES=$(grep -o '[0-9]* bytes' "$DD_LOG" | head -1 | awk '{print $1}')
+    if [ -n "$DD_BYTES" ]; then
+        DD_MIB=$(( DD_BYTES / 1048576 ))
+        ui_print "  Wrote $DD_MIB MiB to USERDATA."
+        if [ "$DD_MIB" -lt 1024 ]; then
+            abort "Root image suspiciously small ($DD_MIB MiB). Expected ~20480 MiB."
+        fi
+    fi
+
     sync
-    ui_print "  Root image written to USERDATA."
+
+    # Post-write verification: check HFSX signature at offset 0x400.
+    # HFS+ magic = 0x482B, HFSX (case-sensitive) version >= 5.
+    HFSX_SIG=$(dd if="$DATA_DEV" bs=1 skip=1024 count=2 2>/dev/null | od -A n -t x1 | tr -d ' ')
+    if [ "$HFSX_SIG" != "482b" ]; then
+        abort "USERDATA does not contain a valid HFS+/HFSX filesystem (magic: $HFSX_SIG). Root image write may have failed silently."
+    fi
+    ui_print "  HFSX filesystem signature verified on USERDATA."
 fi
 
 set_progress 0.60

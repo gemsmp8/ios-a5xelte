@@ -715,6 +715,229 @@ def test_ios_root_workflow():
 
 
 # ---------------------------------------------------------------------------
+# 10. Root streaming safety (update-binary structural checks)
+# ---------------------------------------------------------------------------
+
+def test_root_streaming_safety():
+    """Verify update-binary handles streaming edge cases correctly."""
+    print("\n--- 10. Root streaming safety ---")
+    mod = load_module('mkinstaller_s', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    # Pipeline error detection
+    report("captures unzip exit code", 'UNZIP_RC' in s or 'unzip_rc' in s.lower(),
+           "must detect unzip -p failure independently of dd")
+    report("captures gzip exit code", 'GZIP_RC' in s or 'gzip_rc' in s.lower(),
+           "must detect gzip -dc failure independently of dd")
+    report("checks unzip exit", 'UNZIP_EXIT' in s,
+           "must abort on unzip failure")
+    report("checks gzip exit", 'GZIP_EXIT' in s,
+           "must abort on gzip failure")
+
+    # dd byte count verification
+    report("captures dd stderr", 'DD_LOG' in s,
+           "must capture dd byte count for size verification")
+    report("checks written size", 'DD_MIB' in s or 'DD_BYTES' in s,
+           "must verify reasonable write size")
+    report("rejects tiny root", '1024' in s and 'small' in s.lower(),
+           "must reject suspiciously small root image")
+
+    # Post-write HFSX verification
+    report("verifies HFSX magic post-write", 'HFSX' in s or '482b' in s,
+           "must check HFS+/HFSX signature on USERDATA after write")
+    report("reads back from DATA_DEV", 'dd if="$DATA_DEV"' in s,
+           "must readback from USERDATA to verify filesystem")
+
+    # Root part ordering
+    report("verifies contiguous parts", 'contiguous' in s.lower() or 'EXPECTED' in s,
+           "must detect gaps in part numbering")
+    report("sorts root parts", 'sort' in s,
+           "parts must be concatenated in order")
+
+    # No pipefail assumption
+    report("does not assume pipefail", 'pipefail' not in s or 'no pipefail' in s.lower(),
+           "TWRP busybox ash does not support pipefail")
+
+    # USERDATA location detection
+    report("detects /storage/emulated", '/storage/emulated/' in s)
+    report("detects /storage/sdcard0", '/storage/sdcard0/' in s,
+           "some S7 variants use /storage/sdcard0 for internal")
+
+    # Destructive write tracking
+    report("tracks WROTE_USERDATA", 'WROTE_USERDATA=1' in s)
+    report("tracks WROTE_BOOT", 'WROTE_BOOT=1' in s)
+    report("abort reports partial writes",
+           'Partial writes' in s or 'USERDATA was modified' in s)
+
+
+# ---------------------------------------------------------------------------
+# 11. ZIP builder root part handling
+# ---------------------------------------------------------------------------
+
+def test_zip_root_parts():
+    """Verify ZIP builder handles root parts correctly."""
+    print("\n--- 11. ZIP builder root part handling ---")
+    mod = load_module('mkinstaller_r', TOOLS / 'herolte-mkinstaller.py')
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        # Create fake root parts (gzip-compressed dummy data)
+        import gzip as gz
+        for i in range(3):
+            data = os.urandom(1024)
+            with gz.open(str(td / f'root.img.gz.part{i:02d}'), 'wb') as f:
+                f.write(data)
+
+        parts = sorted(str(p) for p in td.glob('root.img.gz.part*'))
+        report("verify_root_parts accepts valid parts",
+               mod.verify_root_parts(parts) == parts)
+
+        # Missing part
+        missing = [str(td / 'nonexistent.part00')]
+        try:
+            mod.verify_root_parts(missing)
+            report("verify_root_parts rejects missing file", False)
+        except SystemExit:
+            report("verify_root_parts rejects missing file", True)
+
+        # Empty list
+        try:
+            mod.verify_root_parts([])
+            report("verify_root_parts rejects empty list", False)
+        except SystemExit:
+            report("verify_root_parts rejects empty list", True)
+
+        # Verify root parts get correct arcnames in ZIP
+        pack_boot = load_module('pack_boot_r2', TOOLS / 'herolte-pack-boot.py')
+        stock = make_android_boot(make_arm64_image(4096))
+        (td / 'stock.img').write_bytes(stock)
+        (td / 'loader.Image').write_bytes(make_arm64_image(8192))
+        (td / 'payload.bin').write_bytes(b'SWEETXNU' + b'\x01' + b'\x00' * 4087)
+
+        class PArgs:
+            pass
+        PArgs.stock = td / 'stock.img'
+        PArgs.image = td / 'loader.Image'
+        PArgs.output = td / 'xnu-boot.img'
+        PArgs.append = td / 'payload.bin'
+        PArgs.ramdisk = None
+        PArgs.partition_size = 41943040
+        pack_boot.cmd_pack(PArgs())
+
+        mesa_dir = td / 'mesa'
+        make_mesa_dir(mesa_dir)
+        drop_path = mod.build_drop_package(str(mesa_dir), str(td))
+        boot_sha = mod.sha256_file(str(td / 'stock.img'))
+
+        output = td / 'with-root.zip'
+        checksums = []
+        with zipfile.ZipFile(str(output), 'w', zipfile.ZIP_STORED) as zf:
+            zf.writestr('META-INF/com/google/android/updater-script',
+                        mod.UPDATER_SCRIPT)
+            zf.writestr('META-INF/com/google/android/update-binary',
+                        mod.UPDATE_BINARY)
+
+            def add_file(arcname, filepath):
+                zf.write(filepath, arcname)
+                checksums.append((mod.sha256_file(filepath), arcname))
+
+            add_file('boot/xnu-boot.img', str(td / 'xnu-boot.img'))
+            add_file('boot/drop-package.bin', drop_path)
+            zf.writestr('boot/boot-stock-sha256.txt', boot_sha + '\n')
+            for part in parts:
+                name = os.path.basename(part)
+                add_file(f'root/{name}', part)
+            sums = '\n'.join(f'{h}  {n}' for h, n in checksums) + '\n'
+            zf.writestr('SHA256SUMS', sums)
+
+        with zipfile.ZipFile(str(output)) as zf:
+            names = zf.namelist()
+            root_names = sorted(n for n in names if n.startswith('root/'))
+            report("root parts in ZIP",
+                   len(root_names) == 3)
+            report("root parts sorted correctly",
+                   root_names == ['root/root.img.gz.part00',
+                                  'root/root.img.gz.part01',
+                                  'root/root.img.gz.part02'])
+
+            sums_text = zf.read('SHA256SUMS').decode()
+            sum_files = {l.split('  ', 1)[1] for l in sums_text.strip().split('\n')}
+            report("SHA256SUMS covers all root parts",
+                   all(f'root/root.img.gz.part{i:02d}' in sum_files for i in range(3)))
+
+            # Verify each root part's checksum is correct
+            ok = True
+            for rn in root_names:
+                expected = next(l.split('  ')[0] for l in sums_text.strip().split('\n')
+                               if l.endswith(rn))
+                actual = hashlib.sha256(zf.read(rn)).hexdigest()
+                if expected != actual:
+                    ok = False
+            report("root part checksums all correct", ok)
+
+        # ZIP uses ZIP_STORED (no compression)
+        with zipfile.ZipFile(str(output)) as zf:
+            for info in zf.infolist():
+                if info.filename.startswith('root/'):
+                    report(f"root part {info.filename} is STORED",
+                           info.compress_type == zipfile.ZIP_STORED)
+                    break
+
+
+# ---------------------------------------------------------------------------
+# 12. Installer partition safety
+# ---------------------------------------------------------------------------
+
+def test_partition_safety():
+    """Verify installer only writes to BOOT and USERDATA."""
+    print("\n--- 12. Partition safety ---")
+    mod = load_module('mkinstaller_p', TOOLS / 'herolte-mkinstaller.py')
+    s = mod.UPDATE_BINARY
+
+    # Only two partitions should appear in dd of= commands
+    import re
+    dd_targets = re.findall(r'dd\s+[^|]*of="?\$?(\w+)', s)
+    dd_of_paths = re.findall(r'of="([^"]*)"', s)
+    dd_of_vars = re.findall(r'of="\$([^"]*)"', s)
+
+    report("dd targets only DATA_DEV and BOOT_DEV",
+           all(v in ('DATA_DEV', 'BOOT_DEV') for v in dd_of_vars),
+           f"found: {dd_of_vars}")
+
+    # No writes to forbidden partitions
+    forbidden = ['EFS', 'RECOVERY', 'RADIO', 'MODEM', 'CP', 'PARAM',
+                 'HIDDEN', 'SYSTEM', 'CACHE']
+    for part in forbidden:
+        report(f"no write to {part}",
+               f'by-name/{part}' not in s,
+               f"found reference to {part}")
+
+    # BOOT is flashed after USERDATA (step 7 after step 5/6)
+    boot_flash_pos = s.find('dd if="$XNU_BOOT" of="$BOOT_DEV"')
+    root_write_pos = s.find('dd of="$DATA_DEV" bs=1048576')
+    drop_write_pos = s.find('dd if="$TMPDIR/boot/drop-package.bin" of="$DATA_DEV"')
+    report("BOOT flashed after root write",
+           boot_flash_pos > root_write_pos > 0,
+           "BOOT must be last to preserve Android if root fails")
+    report("BOOT flashed after drop zone write",
+           boot_flash_pos > drop_write_pos > 0)
+
+    # Recovery instructions present
+    report("rollback instructions present",
+           'ROLLBACK TO ANDROID' in s)
+    report("rollback mentions stock BOOT",
+           'boot-stock.img' in s)
+    report("rollback mentions Format Data",
+           'Format Data' in s)
+
+    # No claim of Android recoverability without external backup
+    report("no false safety claim after writes",
+           'No changes were made' not in s or 'WROTE_USERDATA' in s,
+           "abort must not claim 'no changes' after destructive ops")
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     print("King-iOS16 Installer Test Suite")
@@ -729,6 +952,9 @@ if __name__ == '__main__':
     test_adt_generation()
     test_payload_structure()
     test_ios_root_workflow()
+    test_root_streaming_safety()
+    test_zip_root_parts()
+    test_partition_safety()
 
     print(f"\n{'=' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")
