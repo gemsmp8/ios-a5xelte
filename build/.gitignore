@@ -1,0 +1,5 @@
+# Build artifacts — large binaries, CI downloads, intermediate outputs.
+# Reproduced by CI or herolte-mkinstaller.py; do not commit.
+*
+!.gitignore
+!twrp-preflight.sh
